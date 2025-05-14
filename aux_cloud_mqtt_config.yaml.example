@@ -1,0 +1,24 @@
+# AUX Cloud MQTT Bridge Configuration
+
+mqtt:
+  # MQTT broker settings
+  host: localhost
+  port: 1883
+  username: your_mqtt_username
+  password: your_mqtt_password
+  client_id: aux_cloud_mqtt
+
+aux_cloud:
+  # AUX Cloud API credentials
+  email: your_email@example.com
+  password: your_password
+  # Region options: eu, usa, cn (case insensitive)
+  region: eu
+
+settings:
+  # Time in seconds between device state updates
+  update_interval: 60
+  # Enable WebSocket for real-time updates (recommended)
+  enable_websocket: true
+  # Log level (DEBUG, INFO, WARNING, ERROR)
+  log_level: INFO

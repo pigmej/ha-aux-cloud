@@ -1,0 +1,22 @@
+[Unit]
+Description=AUX Cloud MQTT Bridge
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /path/to/ha-aux-cloud/aux_cloud_mqtt.py
+WorkingDirectory=/path/to/ha-aux-cloud
+Environment=CONFIG_PATH=/path/to/ha-aux-cloud/aux_cloud_mqtt_config.yaml
+Restart=on-failure
+RestartSec=30
+User=yourusername
+Group=yourusername
+
+# Optional security enhancements:
+# Make it harder for others to snoop on the process
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
