@@ -4,3 +4,5 @@ pipfile
 pipfile.lock
 .idea
 /config.yaml
+.aider*
+aux_cloud_mqtt_config.yaml
