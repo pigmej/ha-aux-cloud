@@ -262,20 +262,20 @@ class AuxCloudMQTTBridge:
 
         # Process message and update device state if applicable
         try:
-            if message.get("msgtype") == "devpush":
-                data = message.get("data", {})
-                payload = data.get("payload", {}).get("data")
+            if message.get("msgtype") == "push" and message.get("topic") == "devpush":
+                data = message.get("data", {}).get("data")
+                # payload = data.get("payload", {}).get("data")
 
-                if not payload:
-                    _LOGGER.warning("WebSocket message missing payload data")
-                    return
+                # if not payload:
+                #     _LOGGER.warning("WebSocket message missing payload data")
+                #     return
 
                 # Try to decode base64 payload if present
                 try:
-                    decoded = json.loads(base64.b64decode(payload).decode())
-                    _LOGGER.debug("Decoded WebSocket payload: %s", decoded)
+                    decoded = json.loads(base64.b64decode(data).decode())
+                    _LOGGER.debug("Decoded WebSocket data: %s", decoded)
                 except Exception as decode_err:
-                    _LOGGER.error("Error decoding WebSocket payload: %s", decode_err)
+                    _LOGGER.error("Error decoding WebSocket data: %s", decode_err)
                     return
 
                 device_id = decoded.get("did")
@@ -305,7 +305,9 @@ class AuxCloudMQTTBridge:
                         "Updated device state from WebSocket notification: %s",
                         device_id,
                     )
-            elif message.get("msgtype") == "devnotify":
+            elif (
+                message.get("msgtype") == "devnotify"
+            ):  # TODO: not sure about that part at all, got that message once and kinda no idea why.
                 data = message.get("data", {})
                 device_id = data.get("did")
 
@@ -647,7 +649,7 @@ class AuxCloudMQTTBridge:
                 devices = await self.aux_api.get_devices(family_id)
                 for device in devices:
                     print(device)
-                    all_devices[device["mac"]] = device
+                    all_devices[device["endpointId"]] = device
 
             self.devices = all_devices
             _LOGGER.info(
