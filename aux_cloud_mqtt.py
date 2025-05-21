@@ -701,7 +701,7 @@ class AuxCloudMQTTBridge:
 
             device_info = {
                 "id": device_id,
-                "name": device.get("name", f"AUX Device {device_id}"),
+                "name": device.get("friendlyName", f"AUX Device {device_id}"),
                 "type": device.get("type", "unknown"),
                 "online": device.get("online", False),
                 "family_id": device.get("familyId"),
