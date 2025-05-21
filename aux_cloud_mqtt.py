@@ -70,6 +70,7 @@ class AuxCloudMQTTBridge:
         aux_password: str = None,
         aux_region: str = "eu",
         update_interval: int = 60,
+        device_refresh_interval: int = 3600,  # Default to refresh every hour
         enable_websocket: bool = True,
     ):
         """Initialize the MQTT bridge."""
@@ -82,6 +83,7 @@ class AuxCloudMQTTBridge:
         self.aux_password = aux_password
         self.aux_region = aux_region.lower()  # Ensure lowercase for API
         self.update_interval = update_interval
+        self.device_refresh_interval = device_refresh_interval
         self.enable_websocket = enable_websocket
 
         self._mqtt_client = None
@@ -91,6 +93,7 @@ class AuxCloudMQTTBridge:
         self.connected = False
         self.running = False
         self.device_tasks = {}
+        self.refresh_task = None
 
     async def async_setup(self):
         """Set up the bridge."""
@@ -142,6 +145,9 @@ class AuxCloudMQTTBridge:
                 self.device_tasks[device_id] = asyncio.create_task(
                     self._device_update_loop(device_id)
                 )
+
+            # Start periodic device refresh task
+            self.refresh_task = asyncio.create_task(self._device_refresh_loop())
 
             return True
         except AuxApiError as err:
@@ -756,6 +762,39 @@ class AuxCloudMQTTBridge:
             json.dumps({"timestamp": time.time(), "message": error_message}),
         )
 
+    async def _device_refresh_loop(self):
+        """Periodically refresh the list of devices."""
+        while self.running:
+            try:
+                # Wait for the refresh interval
+                await asyncio.sleep(self.device_refresh_interval)
+
+                if not self.running:
+                    break
+
+                _LOGGER.info("Refreshing devices list")
+
+                # Store existing device IDs
+                existing_device_ids = set(self.devices.keys())
+
+                # Update devices and families
+                await self._update_devices_and_families()
+
+                # Check for new devices
+                current_device_ids = set(self.devices.keys())
+                new_device_ids = current_device_ids - existing_device_ids
+
+                # Start update loops for new devices
+                for device_id in new_device_ids:
+                    _LOGGER.info(f"Starting update loop for new device: {device_id}")
+                    self.device_tasks[device_id] = asyncio.create_task(
+                        self._device_update_loop(device_id)
+                    )
+
+            except Exception as err:
+                _LOGGER.error("Error in device refresh loop: %s", err)
+                await asyncio.sleep(60)  # Wait a bit longer after error
+
     async def _device_update_loop(self, device_id: str):
         """Update loop for a single device."""
         while self.running:
@@ -832,6 +871,18 @@ class AuxCloudMQTTBridge:
                     _LOGGER.warning(f"Task cancellation timed out")
             except Exception as err:
                 _LOGGER.warning(f"Error cancelling task: {err}")
+
+        # Cancel the device refresh task
+        if self.refresh_task:
+            try:
+                self.refresh_task.cancel()
+                # Wait for task to be cancelled, but with timeout
+                try:
+                    await asyncio.wait_for(self.refresh_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Refresh task cancellation timed out")
+            except Exception as err:
+                _LOGGER.warning(f"Error cancelling refresh task: {err}")
 
         # Set device availability status to offline
         if self.connected:
@@ -930,6 +981,9 @@ async def main():
         aux_password=config.get("aux_cloud", {}).get("password"),
         aux_region=config.get("aux_cloud", {}).get("region", "eu"),
         update_interval=int(config.get("settings", {}).get("update_interval", 60)),
+        device_refresh_interval=int(
+            config.get("settings", {}).get("device_refresh_interval", 3600)
+        ),
         enable_websocket=bool(config.get("settings", {}).get("enable_websocket", True)),
     )
 

@@ -36,13 +36,18 @@ class AuxCloudWebSocket:
         Initialize the WebSocket connection and authenticate to the API
         """
         url = f"{self.websocket_url}/appsync/apprelay/relayconnect"
+        _LOGGER.debug("Attempting WebSocket connection to: %s", url)
 
         try:
             session = aiohttp.ClientSession()
+            _LOGGER.debug("Using headers: %s", self.headers)
             self.websocket = await session.ws_connect(
-                url, headers=self.headers, ssl=False
+                url, headers=self.headers, ssl=False, heartbeat=15
             )
-            _LOGGER.info("WebSocket connection established.")
+            _LOGGER.info(
+                "WebSocket connection established. Protocol: %s",
+                self.websocket.protocol,
+            )
 
             # Start listening for messages
             asyncio.create_task(self._listen_to_websocket())
@@ -67,10 +72,17 @@ class AuxCloudWebSocket:
     async def _listen_to_websocket(self):
         try:
             async for msg in self.websocket:
+                _LOGGER.debug("Raw WebSocket message type: %s", msg.type)
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    _LOGGER.debug("Received WebSocket text: %s", msg.data)
                     data = json.loads(msg.data)
                     status = data.get("status", -1)
                     msgtype = data.get("msgtype", None)
+
+                    # Add special handling for connection status messages
+                    if msgtype == "sysmsg":
+                        _LOGGER.info("System message: %s", data.get("message"))
+                        continue
 
                     if status != 0 and msgtype in {"initk", "pingk"}:
                         await self.close_websocket()
@@ -120,9 +132,13 @@ class AuxCloudWebSocket:
                 await self._schedule_reconnect()
 
     async def _keepalive_loop(self):
-        while not self.websocket.closed:
-            await self._keepalive_websocket()
-            await asyncio.sleep(10)  # Send keep-alive every 10 seconds
+        while True:
+            if self.websocket and not self.websocket.closed:
+                await self._keepalive_websocket()
+            else:
+                _LOGGER.warning("Keep-alive loop exiting because WebSocket is closed")
+                break
+            await asyncio.sleep(60)  # Send keep-alive every 10 seconds
 
     async def _notify_listeners(self, message: dict):
         """
@@ -148,16 +164,21 @@ class AuxCloudWebSocket:
             self._reconnect_task = asyncio.create_task(self._reconnect())
 
     async def _reconnect(self):
-        while not self._stop_reconnect.is_set():
-            _LOGGER.debug("Attempting to reconnect WebSocket...")
+        retry_count = 0
+        max_retries = 5  # Add maximum retry limit
+        while not self._stop_reconnect.is_set() and retry_count < max_retries:
+            _LOGGER.debug("Reconnect attempt %s/%s", retry_count + 1, max_retries)
             try:
                 await self.initialize_websocket()
-                _LOGGER.debug("Reconnected to WebSocket.")
-                self._reconnect_task = None
-                return
+                if self.websocket and not self.websocket.closed:
+                    _LOGGER.info("WebSocket reconnected successfully")
+                    self._reconnect_task = None
+                    retry_count = 0  # Reset counter on success
+                    return
             except (ConnectionError, aiohttp.ClientError, asyncio.TimeoutError) as e:
                 _LOGGER.error("Reconnect failed: %s", e)
-                await asyncio.sleep(10)  # Retry after 10 seconds
+                retry_count += 1
+                await asyncio.sleep(min(2**retry_count, 30))  # Exponential backoff
 
     async def send_data(self, data: dict):
         """

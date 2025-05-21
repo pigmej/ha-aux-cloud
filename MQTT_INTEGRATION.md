@@ -187,7 +187,7 @@ To enable more detailed debugging, set the `log_level` to `DEBUG` in your config
 
 ```bash
 # Show MQTT debug output
-PYTHONPATH=. python -m paho.mqtt.client -d -h localhost 
+PYTHONPATH=. python -m paho.mqtt.client -d -h localhost
 
 # Run with debug logging
 python aux_cloud_mqtt.py
