@@ -9,6 +9,7 @@ import logging
 import signal
 import sys
 import time
+import fcntl
 from typing import Dict, Any, Optional
 import paho.mqtt.client as mqtt
 import yaml
@@ -61,7 +62,10 @@ class AuxCloudMQTTBridge:
         self.mqtt_port = mqtt_port
         self.mqtt_username = mqtt_username
         self.mqtt_password = mqtt_password
-        self.mqtt_client_id = mqtt_client_id
+        # Make client ID unique to prevent multiple connections
+        import time
+
+        self.mqtt_client_id = f"{mqtt_client_id}_{int(time.time())}"
         self.aux_email = aux_email
         self.aux_password = aux_password
         self.aux_region = aux_region.lower()
@@ -130,6 +134,16 @@ class AuxCloudMQTTBridge:
 
     def _setup_mqtt(self):
         """Set up the MQTT client."""
+        # Ensure we don't have an existing connection
+        if self._mqtt_client:
+            try:
+                _LOGGER.info("Stopping MQTT client: %s", self.mqtt_client_id)
+                self._mqtt_client.loop_stop()
+                self._mqtt_client.disconnect()
+            except Exception as err:
+                _LOGGER.warning("Error stopping MQTT client: %s", err)
+            self._mqtt_client = None
+
         self._mqtt_client = mqtt.Client(
             client_id=self.mqtt_client_id, protocol=mqtt.MQTTv311
         )
@@ -142,7 +156,10 @@ class AuxCloudMQTTBridge:
         self._mqtt_client.on_message = self._on_mqtt_message
 
         _LOGGER.info(
-            "Connecting to MQTT broker at %s:%s", self.mqtt_host, self.mqtt_port
+            "Connecting to MQTT broker at %s:%s with client ID: %s",
+            self.mqtt_host,
+            self.mqtt_port,
+            self.mqtt_client_id,
         )
         self._mqtt_client.connect(self.mqtt_host, self.mqtt_port, keepalive=60)
         self._mqtt_client.loop_start()
@@ -248,10 +265,15 @@ class AuxCloudMQTTBridge:
         self.connected = False
         if rc != 0:
             _LOGGER.warning(
-                "Disconnected from MQTT broker with code %s", rc
+                "Disconnected from MQTT broker with code %s (client: %s)",
+                rc,
+                self.mqtt_client_id,
             )
         else:
-            _LOGGER.info("Disconnected from MQTT broker normally")
+            _LOGGER.info(
+                "Disconnected from MQTT broker normally (client: %s)",
+                self.mqtt_client_id,
+            )
 
     def _on_mqtt_message(self, client, userdata, msg):
         """Handle incoming MQTT messages."""
@@ -441,14 +463,19 @@ class AuxCloudMQTTBridge:
             return
 
         try:
-            # Execute any pending commands first
-            await self._execute_pending_commands(device_id)
-
-            # Then refresh device state (in case there were no pending commands)
-            await self._ensure_logged_in()
-            device = self.devices[device_id]
-            updated_state = await self.aux_api.get_device_params(device)
-            self._publish_device_state(device_id, updated_state)
+            # Check if there are pending commands to apply
+            if device_id in self.pending_commands and self.pending_commands[device_id]:
+                # Execute pending commands (this will also refresh state)
+                await self._execute_pending_commands(device_id)
+            else:
+                # No pending commands, just refresh device state
+                await self._ensure_logged_in()
+                device = self.devices[device_id]
+                updated_state = await self.aux_api.get_device_params(device)
+                self._publish_device_state(device_id, updated_state)
+                self._publish_response(
+                    device_id, True, "Device state refreshed (no pending commands)"
+                )
 
         except Exception as err:
             _LOGGER.error("Error in apply command for device %s: %s", device_id, err)
@@ -500,8 +527,18 @@ class AuxCloudMQTTBridge:
                 for device_id, device in self.devices.items():
                     try:
                         if self.aux_api:
-                            device_state = await self.aux_api.get_device_params(device)
-                            self._publish_device_state(device_id, device_state)
+                            # First, apply any pending commands for this device
+                            if (
+                                device_id in self.pending_commands
+                                and self.pending_commands[device_id]
+                            ):
+                                await self._execute_pending_commands(device_id)
+                            else:
+                                # No pending commands, just get current state
+                                device_state = await self.aux_api.get_device_params(
+                                    device
+                                )
+                                self._publish_device_state(device_id, device_state)
                     except Exception as err:
                         _LOGGER.error("Error updating device %s: %s", device_id, err)
 
@@ -642,6 +679,16 @@ class AuxCloudMQTTBridge:
             timer.cancel()
         self.apply_timers.clear()
 
+        # Apply any remaining pending commands before shutdown
+        _LOGGER.info("Applying remaining pending commands before shutdown")
+        for device_id in list(self.pending_commands.keys()):
+            if self.pending_commands[device_id]:
+                try:
+                    await self._execute_pending_commands(device_id)
+                    _LOGGER.info("Applied pending commands for device %s on shutdown", device_id)
+                except Exception as err:
+                    _LOGGER.error("Error applying pending commands on shutdown for device %s: %s", device_id, err)
+
         # Clear pending commands
         self.pending_commands.clear()
 
@@ -676,6 +723,18 @@ async def main():
     """Run the AUX Cloud MQTT Bridge."""
     if sys.version_info < (3, 7):
         _LOGGER.error("This script requires Python 3.7 or newer")
+        return 1
+
+    # Prevent multiple instances
+    lock_file = "/tmp/aux_cloud_mqtt.lock"
+    try:
+        lock_fd = open(lock_file, "w")
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        _LOGGER.info("Acquired process lock")
+    except (IOError, OSError):
+        _LOGGER.error("Another instance of aux_cloud_mqtt is already running")
         return 1
 
     # Handle graceful shutdown
@@ -719,15 +778,34 @@ async def main():
         apply_timeout=int(config.get("settings", {}).get("apply_timeout", 30)),
     )
 
-    if not await bridge.async_setup():
-        _LOGGER.error("Failed to set up AUX Cloud MQTT Bridge")
+    try:
+        if not await bridge.async_setup():
+            _LOGGER.error("Failed to set up AUX Cloud MQTT Bridge")
+            return 1
+
+        _LOGGER.info("AUX Cloud MQTT Bridge started successfully")
+
+        # Wait for stop signal
+        await stop_event.wait()
+
+    except Exception as err:
+        _LOGGER.error("Unexpected error in main loop: %s", err)
         return 1
+    finally:
+        # Stop bridge
+        try:
+            await bridge.async_stop()
+        except Exception as err:
+            _LOGGER.error("Error stopping bridge: %s", err)
 
-    # Wait for stop signal
-    await stop_event.wait()
+        # Release lock
+        try:
+            lock_fd.close()
+            os.remove(lock_file)
+            _LOGGER.info("Released process lock")
+        except Exception as err:
+            _LOGGER.warning("Error releasing lock: %s", err)
 
-    # Stop bridge
-    await bridge.async_stop()
     return 0
 
 
