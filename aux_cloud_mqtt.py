@@ -8,18 +8,15 @@ import os
 import logging
 import signal
 import sys
-import threading
 import time
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 import paho.mqtt.client as mqtt
-import concurrent.futures
 import yaml
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from custom_components.aux_cloud.api.aux_cloud import (
     AuxCloudAPI,
     AuxApiError,
-    ExpiredTokenError,
 )
 
 logging.basicConfig(
@@ -42,22 +39,7 @@ ERROR_TOPIC = f"{TOPIC_PREFIX}/error"
 
 
 class AuxCloudMQTTBridge:
-    """Bridge between AUX Cloud API and MQTT.
-
-    This class provides a bridge between the AUX Cloud API and MQTT,
-    enabling control of AUX devices (air conditioners, heat pumps, etc.)
-    via MQTT. This allows integration with Homey and other smart home platforms
-    that support MQTT.
-
-    Features:
-    - Automatic device discovery
-    - Real-time state updates via polling and WebSocket
-    - Command handling via MQTT
-    - Status reporting and error handling
-    """
-
-    # Store command queue for thread-safe operations
-    _command_queue = []
+    """Bridge between AUX Cloud API and MQTT for smart home integration."""
 
     def __init__(
         self,
@@ -66,11 +48,11 @@ class AuxCloudMQTTBridge:
         mqtt_username: Optional[str] = None,
         mqtt_password: Optional[str] = None,
         mqtt_client_id: str = "aux_cloud_mqtt",
-        aux_email: str = None,
-        aux_password: str = None,
+        aux_email: Optional[str] = None,
+        aux_password: Optional[str] = None,
         aux_region: str = "eu",
         update_interval: int = 60,
-        device_refresh_interval: int = 3600,  # Default to refresh every hour
+        device_refresh_interval: int = 3600,
         enable_websocket: bool = True,
     ):
         """Initialize the MQTT bridge."""
@@ -81,180 +63,129 @@ class AuxCloudMQTTBridge:
         self.mqtt_client_id = mqtt_client_id
         self.aux_email = aux_email
         self.aux_password = aux_password
-        self.aux_region = aux_region.lower()  # Ensure lowercase for API
+        self.aux_region = aux_region.lower()
         self.update_interval = update_interval
         self.device_refresh_interval = device_refresh_interval
         self.enable_websocket = enable_websocket
 
-        self._mqtt_client = None
-        self.aux_api = None
+        self._mqtt_client: Optional[mqtt.Client] = None
+        self.aux_api: Optional[AuxCloudAPI] = None
         self.devices = {}
         self.families = {}
         self.connected = False
         self.running = False
-        self.device_tasks = {}
-        self.refresh_task = None
+        self.tasks = {}
+        self.command_queue = asyncio.Queue()
 
     async def async_setup(self):
         """Set up the bridge."""
         _LOGGER.info("Setting up AUX Cloud MQTT Bridge")
 
-        # Clear command queue at start
-        AuxCloudMQTTBridge._command_queue = []
-
-        # Store the event loop for async operations from threads
-        self._event_loop = asyncio.get_event_loop()
-
-        # Initialize the API with just the region
-        self.aux_api = AuxCloudAPI(self.aux_region)
-
         try:
-            # Set the email and password before calling login
-            self.aux_api.email = self.aux_email
-            self.aux_api.password = self.aux_password
+            # Initialize API
+            await self._setup_api()
 
-            # Now login to the API
-            await self.aux_api.login()
-
-            if not self.aux_api.is_logged_in():
-                _LOGGER.error("Failed to login to AUX Cloud API")
-                return False
-
-            _LOGGER.info("Successfully logged in to AUX Cloud API")
-
-            # Set up MQTT client
+            # Set up MQTT
             self._setup_mqtt()
 
-            # Get initial devices and families
+            # Load initial data
             await self._update_devices_and_families()
 
-            # Set up WebSocket if enabled AFTER getting devices
-            if (
-                self.enable_websocket
-                and self.aux_api.loginsession
-                and self.aux_api.userid
-            ):
+            # Set up WebSocket if enabled
+            if self.enable_websocket:
                 await self._setup_websocket()
-                await (
-                    self._subscribe_to_device_updates()
-                )  # Moved here after device loading
 
-            # Start device update loops
+            # Start background tasks
+            self._start_background_tasks()
+
             self.running = True
-            for device_id in self.devices:
-                self.device_tasks[device_id] = asyncio.create_task(
-                    self._device_update_loop(device_id)
-                )
-
-            # Start periodic device refresh task
-            self.refresh_task = asyncio.create_task(self._device_refresh_loop())
-
             return True
-        except AuxApiError as err:
-            _LOGGER.error("Error setting up AUX Cloud API: %s", err)
+
+        except Exception as err:
+            _LOGGER.error("Error setting up bridge: %s", err)
             return False
+
+    async def _setup_api(self):
+        """Initialize and login to AUX Cloud API."""
+        if not self.aux_email or not self.aux_password:
+            raise AuxApiError("AUX email and password are required")
+
+        self.aux_api = AuxCloudAPI(self.aux_region)
+
+        await self.aux_api.login(self.aux_email, self.aux_password)
+        if not self.aux_api.is_logged_in():
+            raise AuxApiError("Failed to login to AUX Cloud API")
+
+        _LOGGER.info("Successfully logged in to AUX Cloud API")
+
+    def _setup_mqtt(self):
+        """Set up the MQTT client."""
+        self._mqtt_client = mqtt.Client(
+            client_id=self.mqtt_client_id, protocol=mqtt.MQTTv311
+        )
+
+        if self.mqtt_username and self.mqtt_password:
+            self._mqtt_client.username_pw_set(self.mqtt_username, self.mqtt_password)
+
+        self._mqtt_client.on_connect = self._on_mqtt_connect
+        self._mqtt_client.on_disconnect = self._on_mqtt_disconnect
+        self._mqtt_client.on_message = self._on_mqtt_message
+
+        _LOGGER.info(
+            "Connecting to MQTT broker at %s:%s", self.mqtt_host, self.mqtt_port
+        )
+        self._mqtt_client.connect(self.mqtt_host, self.mqtt_port)
+        self._mqtt_client.loop_start()
 
     async def _setup_websocket(self):
         """Set up WebSocket connection."""
-        if hasattr(self.aux_api, "initialize_websocket"):
-            try:
-                await self.aux_api.initialize_websocket()
-                _LOGGER.info("WebSocket connection initialized")
-
-                # Add listener for device state updates
-                if hasattr(self.aux_api, "ws_api") and self.aux_api.ws_api:
-                    self.aux_api.ws_api.add_websocket_listener(self._handle_ws_message)
-                    _LOGGER.info("WebSocket listener added")
-
-                    # Monitor WebSocket connection and reconnect if needed
-                    self.device_tasks["websocket_monitor"] = asyncio.create_task(
-                        self._websocket_monitor()
-                    )
-            except Exception as err:
-                _LOGGER.error("Failed to initialize WebSocket: %s", err)
-                # Try to reconnect after a delay
-                self.device_tasks["websocket_reconnect"] = asyncio.create_task(
-                    self._websocket_reconnect_after_delay()
-                )
-        else:
+        if not self.aux_api or not hasattr(self.aux_api, "initialize_websocket"):
             _LOGGER.warning("WebSocket functionality not available in API")
+            return
 
-    async def _websocket_monitor(self):
-        """Monitor WebSocket connection and reconnect if needed."""
-        while self.running:
-            try:
-                if not hasattr(self.aux_api, "ws_api") or not self.aux_api.ws_api:
-                    _LOGGER.warning("WebSocket API not initialized, attempting setup")
-                    await self._setup_websocket()
-
-                ws_api = self.aux_api.ws_api
-                if ws_api.websocket is None or ws_api.websocket.closed:
-                    _LOGGER.warning(
-                        "WebSocket connection lost, forcing reinitialization"
-                    )
-                    await ws_api.close_websocket()  # Cleanup old connection
-                    await self._setup_websocket()
-
-                    # Only resubscribe if we have devices
-                    if self.devices:
-                        await self._subscribe_to_device_updates()
-                    else:
-                        _LOGGER.warning(
-                            "No devices available for WebSocket resubscription"
-                        )
-
-                await asyncio.sleep(15)  # Check more frequently
-            except asyncio.CancelledError:
-                _LOGGER.info("WebSocket monitor task cancelled")
-                break
-            except Exception as err:
-                _LOGGER.error("Error in WebSocket monitor: %s", err)
-                await asyncio.sleep(30)  # Wait longer after an error
-
-    async def _websocket_reconnect_after_delay(self, delay=10):
-        """Try to reconnect WebSocket after a delay."""
-        await asyncio.sleep(delay)
         try:
             await self.aux_api.initialize_websocket()
             if hasattr(self.aux_api, "ws_api") and self.aux_api.ws_api:
                 self.aux_api.ws_api.add_websocket_listener(self._handle_ws_message)
                 await self._subscribe_to_device_updates()
-            _LOGGER.info("WebSocket reconnected successfully after delay")
+                _LOGGER.info("WebSocket connection established")
         except Exception as err:
-            _LOGGER.error("Failed to reconnect WebSocket after delay: %s", err)
+            _LOGGER.error("Failed to initialize WebSocket: %s", err)
+
+    def _start_background_tasks(self):
+        """Start all background tasks."""
+        self.tasks["command_processor"] = asyncio.create_task(self._command_processor())
+        self.tasks["device_updater"] = asyncio.create_task(self._device_update_loop())
+        self.tasks["device_refresher"] = asyncio.create_task(
+            self._device_refresh_loop()
+        )
 
     async def _subscribe_to_device_updates(self):
         """Subscribe to WebSocket updates for all devices."""
+        if (
+            not self.aux_api
+            or not hasattr(self.aux_api, "ws_api")
+            or not self.aux_api.ws_api
+            or not self.devices
+        ):
+            return
+
         try:
-            if not hasattr(self.aux_api, "ws_api") or not self.aux_api.ws_api:
-                _LOGGER.warning("WebSocket API not available for subscription")
-                return
+            devices = [
+                {
+                    "devSession": device.get("devSession", ""),
+                    "endpointId": device.get("endpointId", ""),
+                    "gatewayId": "",
+                    "pid": "000000000000000000000000c0620000",
+                }
+                for device in self.devices.values()
+            ]
 
-            if not self.devices:
-                _LOGGER.warning("No devices available to subscribe to")
-                return
-
-            timestamp = time.time()
-            devices = []
-
-            # Build device list from our known devices
-            for device_id, device in self.devices.items():
-                devices.append(
-                    {
-                        "devSession": device.get("devSession", ""),
-                        "endpointId": device.get("endpointId", ""),
-                        "gatewayId": "",  # Empty for direct connections
-                        # "pid": device.get("pid", ""),
-                        "pid": "000000000000000000000000c0620000",
-                    }
-                )
-
-            # Send subscription message
             await self.aux_api.ws_api.send_data(
                 {
                     "data": {"devList": devices},
-                    "messageid": timestamp,
-                    "msgtype": "subreset",  # subreset gets current state + future updates
+                    "messageid": time.time(),
+                    "msgtype": "subreset",
                     "topic": "devpush",
                 }
             )
@@ -264,123 +195,26 @@ class AuxCloudMQTTBridge:
 
     async def _handle_ws_message(self, message):
         """Handle WebSocket message."""
-        _LOGGER.debug("Received WebSocket message: %s", message)
-
-        # Process message and update device state if applicable
         try:
             if message.get("msgtype") == "push" and message.get("topic") == "devpush":
                 data = message.get("data", {}).get("data")
-                # payload = data.get("payload", {}).get("data")
-
-                # if not payload:
-                #     _LOGGER.warning("WebSocket message missing payload data")
-                #     return
-
-                # Try to decode base64 payload if present
-                try:
-                    decoded = json.loads(base64.b64decode(data).decode())
-                    _LOGGER.debug("Decoded WebSocket data: %s", decoded)
-                except Exception as decode_err:
-                    _LOGGER.error("Error decoding WebSocket data: %s", decode_err)
+                if not data:
                     return
 
+                decoded = json.loads(base64.b64decode(data).decode())
                 device_id = decoded.get("did")
-                if not device_id:
-                    _LOGGER.warning("WebSocket message missing device ID")
-                    return
 
-                if device_id not in self.devices:
-                    _LOGGER.warning(
-                        "WebSocket message for unknown device ID: %s", device_id
-                    )
-                    return
-
-                # Extract state data from the decoded payload
-                state_update = {}
-                for key, value in decoded.items():
-                    if key not in ["did", "pid"]:  # Skip device identifiers
-                        state_update[key] = value
-
-                if state_update:
-                    _LOGGER.info(
-                        "Using state data from WebSocket message for device: %s",
-                        device_id,
-                    )
-                    self._publish_device_state(device_id, state_update)
-                    _LOGGER.info(
-                        "Updated device state from WebSocket notification: %s",
-                        device_id,
-                    )
-            elif (
-                message.get("msgtype") == "devnotify"
-            ):  # TODO: not sure about that part at all, got that message once and kinda no idea why.
-                data = message.get("data", {})
-                device_id = data.get("did")
-
-                if not device_id:
-                    _LOGGER.warning("WebSocket message missing device ID: %s", message)
-                    return
-
-                if device_id not in self.devices:
-                    _LOGGER.warning(
-                        "WebSocket message for unknown device ID: %s", device_id
-                    )
-                    return
-
-                # Extract state data directly from the message if possible
-                params = data.get("params")
-                if params:
-                    _LOGGER.info(
-                        "Using state data from WebSocket message for device: %s",
-                        device_id,
-                    )
-                    self._publish_device_state(device_id, params)
-                    _LOGGER.info(
-                        "Updated device state from WebSocket notification: %s",
-                        device_id,
-                    )
-                else:
-                    # Fallback to fetching current state
-                    device = self.devices[device_id]
-                    _LOGGER.info(
-                        "Scheduling state fetch for device after WebSocket notification: %s",
-                        device_id,
-                    )
-                    # Schedule a state refresh
-                    self._schedule_state_fetch(device_id, device)
+                if device_id and device_id in self.devices:
+                    state_update = {
+                        k: v for k, v in decoded.items() if k not in ["did", "pid"]
+                    }
+                    if state_update:
+                        self._publish_device_state(device_id, state_update)
+                        _LOGGER.debug(
+                            "Updated device state from WebSocket: %s", device_id
+                        )
         except Exception as err:
             _LOGGER.error("Error handling WebSocket message: %s", err)
-
-    def _setup_mqtt(self):
-        """Set up the MQTT client.
-
-        This method initializes the MQTT client with the current protocol version.
-        """
-
-    def _setup_mqtt(self):
-        """Set up the MQTT client."""
-        # Initialize MQTT client
-        self._mqtt_client = mqtt.Client(
-            client_id=self.mqtt_client_id, protocol=mqtt.MQTTv311
-        )
-        _LOGGER.info("MQTT client initialized")
-
-        if self.mqtt_username and self.mqtt_password:
-            self._mqtt_client.username_pw_set(self.mqtt_username, self.mqtt_password)
-
-        self._mqtt_client.on_connect = self._on_mqtt_connect
-        self._mqtt_client.on_disconnect = self._on_mqtt_disconnect
-        self._mqtt_client.on_message = self._on_mqtt_message
-
-        try:
-            _LOGGER.info(
-                "Connecting to MQTT broker at %s:%s", self.mqtt_host, self.mqtt_port
-            )
-            self._mqtt_client.connect(self.mqtt_host, self.mqtt_port)
-            self._mqtt_client.loop_start()
-        except Exception as err:
-            _LOGGER.error("Failed to connect to MQTT broker: %s", err)
-            raise
 
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         """Handle MQTT connection."""
@@ -388,17 +222,12 @@ class AuxCloudMQTTBridge:
             self.connected = True
             _LOGGER.info("Connected to MQTT broker")
 
-            # Subscribe to all set commands
-            self._mqtt_client.subscribe(f"{TOPIC_PREFIX}/+/set")
+            # Subscribe to command topics
+            if self._mqtt_client:
+                self._mqtt_client.subscribe(f"{TOPIC_PREFIX}/+/set")
+                self._mqtt_client.subscribe(f"{TOPIC_PREFIX}/+/+/set")
+                self._mqtt_client.subscribe(f"{TOPIC_PREFIX}/+/apply")
 
-            # Subscribe to parameter-specific set commands
-            self._mqtt_client.subscribe(f"{TOPIC_PREFIX}/+/+/set")
-
-            # Subscribe to apply commands
-            self._mqtt_client.subscribe(f"{TOPIC_PREFIX}/+/apply")
-
-            # Just publish discovery right away from this thread
-            # No need to schedule through the event loop for this simple operation
             self._publish_device_discovery()
         else:
             _LOGGER.error("Failed to connect to MQTT broker with code %s", rc)
@@ -410,251 +239,137 @@ class AuxCloudMQTTBridge:
 
     def _on_mqtt_message(self, client, userdata, msg):
         """Handle incoming MQTT messages."""
-        topic = msg.topic
-
         try:
             payload = msg.payload.decode("utf-8")
-            _LOGGER.debug("Received MQTT message on topic %s: %s", topic, payload)
+            topic_parts = msg.topic.split("/")
 
-            parts = topic.split("/")
+            if len(topic_parts) == 3 and topic_parts[2] == "set":
+                # Device command
+                device_id = topic_parts[1]
+                command_data = json.loads(payload)
+                asyncio.create_task(
+                    self.command_queue.put(("device_command", device_id, command_data))
+                )
 
-            # Handle main device set topic (aux_cloud/{device_id}/set)
-            if len(parts) == 3 and parts[2] == "set":
-                device_id = parts[1]
-
-                try:
-                    command_data = json.loads(payload)
-                except json.JSONDecodeError:
-                    _LOGGER.error("Invalid JSON payload: %s", payload)
-                    self._publish_error(
-                        f"Invalid JSON payload for device {device_id}: {payload}"
-                    )
-                    return
-
-                # Store command for processing in main loop
-                with threading.Lock():
-                    AuxCloudMQTTBridge._command_queue.append(
-                        (
-                            device_id,
-                            command_data.copy(),
-                            False,
-                        )  # False = no forced refresh
-                    )
-                _LOGGER.debug(f"Command queued for device {device_id}: {command_data}")
-
-            # Handle apply command (aux_cloud/{device_id}/apply)
-            elif len(parts) == 3 and parts[2] == "apply":
-                device_id = parts[1]
-
+            elif len(topic_parts) == 3 and topic_parts[2] == "apply":
+                # Apply command
+                device_id = topic_parts[1]
                 if payload.lower() in ["true", "1", "yes", "on"]:
-                    _LOGGER.info(f"Received apply command for device {device_id}")
-
-                    # Execute apply command immediately instead of queuing
-                    if device_id in self.devices:
-                        # Schedule immediate execution in an async-safe way
-                        asyncio.run_coroutine_threadsafe(
-                            self._handle_apply_command(device_id), self._event_loop
-                        )
-                        _LOGGER.debug(
-                            f"Apply command executed immediately for device {device_id}"
-                        )
-                    else:
-                        _LOGGER.warning(
-                            f"Device {device_id} not found for apply command"
-                        )
-
-            # Handle parameter-specific set topic (aux_cloud/{device_id}/{param}/set)
-            elif len(parts) == 4 and parts[3] == "set":
-                device_id = parts[1]
-                param = parts[2]
-
-                try:
-                    # For parameter-specific topics, payload is the direct value
-                    # Convert it to the appropriate type if possible
-                    value = payload
-
-                    # Try to convert to number or boolean if applicable
-                    if payload.lower() == "true":
-                        value = True
-                    elif payload.lower() == "false":
-                        value = False
-                    else:
-                        try:
-                            if "." in payload:
-                                value = float(payload)
-                            else:
-                                value = int(payload)
-                        except ValueError:
-                            # Keep as string if not convertible
-                            pass
-
-                    # Create command data with single parameter
-                    command_data = {param: value}
-
-                    # Store command for processing in main loop
-                    with threading.Lock():
-                        AuxCloudMQTTBridge._command_queue.append(
-                            (
-                                device_id,
-                                command_data.copy(),
-                                False,
-                            )  # False = no forced refresh
-                        )
-                    _LOGGER.debug(
-                        f"Parameter command queued for device {device_id}: {command_data}"
+                    asyncio.create_task(
+                        self.command_queue.put(("apply_command", device_id, {}))
                     )
-                except Exception as err:
-                    _LOGGER.error("Error processing parameter value: %s", err)
-                    self._publish_error(
-                        f"Error processing value for device {device_id}, parameter {param}: {err}"
-                    )
-            else:
-                _LOGGER.error("Invalid topic format: %s", topic)
-        except UnicodeDecodeError:
-            _LOGGER.error("Failed to decode payload as UTF-8 on topic: %s", topic)
+
+            elif len(topic_parts) == 4 and topic_parts[3] == "set":
+                # Parameter-specific command
+                device_id = topic_parts[1]
+                param = topic_parts[2]
+                value = self._parse_value(payload)
+                command_data = {param: value}
+                asyncio.create_task(
+                    self.command_queue.put(("device_command", device_id, command_data))
+                )
+
         except Exception as err:
             _LOGGER.error("Error handling MQTT message: %s", err)
 
-    async def _handle_apply_command(self, device_id: str):
-        """Handle apply command immediately - forces a device state refresh."""
-        if device_id not in self.devices:
-            self._publish_error(f"Unknown device ID: {device_id}")
-            return
-
-        _LOGGER.info(f"Handling immediate apply command for device {device_id}")
+    def _parse_value(self, payload: str):
+        """Parse string payload to appropriate type."""
+        if payload.lower() == "true":
+            return True
+        elif payload.lower() == "false":
+            return False
 
         try:
-            # Check if we're logged in, otherwise re-login
-            if not self.aux_api.is_logged_in():
-                await self.aux_api.login()
+            return float(payload) if "." in payload else int(payload)
+        except ValueError:
+            return payload
 
-            # Get current device state
-            device = self.devices[device_id]
-            updated_state = await self.aux_api.get_device_params(device)
-
-            # Publish updated state
-            self._publish_device_state(device_id, updated_state)
-
-            # Also run any queued commands for this device
-            commands_to_process = []
-            with threading.Lock():
-                # Find and remove commands for this device from the queue
-                remaining_commands = []
-                for cmd in AuxCloudMQTTBridge._command_queue:
-                    if len(cmd) >= 2 and cmd[0] == device_id:
-                        commands_to_process.append(cmd)
-                    else:
-                        remaining_commands.append(cmd)
-                AuxCloudMQTTBridge._command_queue = remaining_commands
-
-            # Process any commands found for this device
-            for cmd in commands_to_process:
-                try:
-                    if len(cmd) == 2:  # Handle old format commands
-                        await self._handle_device_command(cmd[0], cmd[1], True)
-                    else:
-                        await self._handle_device_command(cmd[0], cmd[1], True)
-                except Exception as cmd_err:
-                    _LOGGER.error(
-                        f"Error processing queued command during apply: {cmd_err}"
-                    )
-
-            # Publish success response
-            self._mqtt_client.publish(
-                COMMAND_RESPONSE_TOPIC,
-                json.dumps(
-                    {
-                        "device_id": device_id,
-                        "success": True,
-                        "message": "Device state refreshed immediately",
-                    }
-                ),
-            )
-        except ExpiredTokenError:
-            _LOGGER.warning("Token expired during apply, attempting to re-login")
+    async def _command_processor(self):
+        """Process commands from the queue."""
+        while self.running:
             try:
-                await self.aux_api.login()
-                await self._handle_apply_command(device_id)
+                command_type, device_id, data = await asyncio.wait_for(
+                    self.command_queue.get(), timeout=1.0
+                )
+
+                if command_type == "device_command":
+                    await self._handle_device_command(device_id, data)
+                elif command_type == "apply_command":
+                    await self._handle_apply_command(device_id)
+
+            except asyncio.TimeoutError:
+                continue
             except Exception as err:
-                self._publish_error(f"Failed to refresh device {device_id}: {err}")
-        except Exception as err:
-            _LOGGER.error(f"Error refreshing device {device_id}: {err}")
-            self._publish_error(f"Error refreshing device {device_id}: {err}")
+                _LOGGER.error("Error processing command: %s", err)
 
     async def _handle_device_command(
-        self, device_id: str, command_data: Dict[str, Any], force_refresh: bool = False
+        self, device_id: str, command_data: Dict[str, Any]
     ):
-        """Handle device command from MQTT."""
-        if device_id not in self.devices:
+        """Handle device command."""
+        if device_id not in self.devices or not self.aux_api:
             self._publish_error(f"Unknown device ID: {device_id}")
             return
 
-        _LOGGER.info(
-            "Handling command for device %s: %s (force_refresh: %s)",
-            device_id,
-            command_data,
-            force_refresh,
-        )
-
         try:
-            # Check if we're logged in, otherwise re-login
-            if not self.aux_api.is_logged_in():
-                await self.aux_api.login()
+            await self._ensure_logged_in()
 
-            # Send command to device if we have any parameters to set
             device = self.devices[device_id]
             if command_data:
                 await self.aux_api.set_device_params(device, command_data)
 
-            # Get updated state after command
             updated_state = await self.aux_api.get_device_params(device)
-
-            # Publish updated state
             self._publish_device_state(device_id, updated_state)
 
-            # Publish command response
-            response_data = {
-                "device_id": device_id,
-                "success": True,
-                "message": "Command executed successfully",
-            }
-
-            if command_data:
-                response_data["command"] = command_data
-            elif force_refresh:
-                response_data["message"] = "Device state refreshed"
-
-            self._mqtt_client.publish(
-                COMMAND_RESPONSE_TOPIC,
-                json.dumps(response_data),
+            self._publish_response(
+                device_id, True, "Command executed successfully", command_data
             )
-        except ExpiredTokenError:
-            _LOGGER.warning("Token expired, attempting to re-login")
-            try:
-                await self.aux_api.login()
-                # Retry command after re-login
-                await self._handle_device_command(device_id, command_data)
-            except Exception as err:
-                self._publish_error(f"Failed to re-login: {err}")
+
         except Exception as err:
             _LOGGER.error("Error executing command for device %s: %s", device_id, err)
             self._publish_error(
                 f"Error executing command for device {device_id}: {err}"
             )
 
+    async def _handle_apply_command(self, device_id: str):
+        """Handle apply command (immediate state refresh)."""
+        if device_id not in self.devices or not self.aux_api:
+            self._publish_error(f"Unknown device ID: {device_id}")
+            return
+
+        try:
+            await self._ensure_logged_in()
+
+            device = self.devices[device_id]
+            updated_state = await self.aux_api.get_device_params(device)
+            self._publish_device_state(device_id, updated_state)
+
+            self._publish_response(device_id, True, "Device state refreshed")
+
+        except Exception as err:
+            _LOGGER.error("Error refreshing device %s: %s", device_id, err)
+            self._publish_error(f"Error refreshing device {device_id}: {err}")
+
+    async def _ensure_logged_in(self):
+        """Ensure API is logged in, re-login if necessary."""
+        if not self.aux_api or not self.aux_api.is_logged_in():
+            if self.aux_api and self.aux_email and self.aux_password:
+                await self.aux_api.login(self.aux_email, self.aux_password)
+
     async def _update_devices_and_families(self):
         """Update devices and families from the API."""
         try:
-            # Get families
+            await self._ensure_logged_in()
+
+            if not self.aux_api:
+                return False
+
             families = await self.aux_api.get_families()
             self.families = {family["familyid"]: family for family in families}
 
-            # Get devices for each family
             all_devices = {}
             for family_id in self.families:
                 devices = await self.aux_api.get_devices(family_id)
                 for device in devices:
-                    print(device)
                     all_devices[device["endpointId"]] = device
 
             self.devices = all_devices
@@ -664,37 +379,59 @@ class AuxCloudMQTTBridge:
                 len(self.families),
             )
 
-            # Publish device discovery after update
             self._publish_device_discovery()
-
             return True
-        except ExpiredTokenError:
-            _LOGGER.warning("Token expired, attempting to re-login")
-            await self.aux_api.login()
-            return await self._update_devices_and_families()
+
         except Exception as err:
             _LOGGER.error("Error updating devices and families: %s", err)
             return False
+
+    async def _device_update_loop(self):
+        """Periodically update device states."""
+        while self.running:
+            try:
+                await self._ensure_logged_in()
+
+                for device_id, device in self.devices.items():
+                    try:
+                        if self.aux_api:
+                            device_state = await self.aux_api.get_device_params(device)
+                            self._publish_device_state(device_id, device_state)
+                    except Exception as err:
+                        _LOGGER.error("Error updating device %s: %s", device_id, err)
+
+                await asyncio.sleep(self.update_interval)
+
+            except Exception as err:
+                _LOGGER.error("Error in device update loop: %s", err)
+                await asyncio.sleep(60)
+
+    async def _device_refresh_loop(self):
+        """Periodically refresh the device list."""
+        while self.running:
+            try:
+                await asyncio.sleep(self.device_refresh_interval)
+                if self.running:
+                    await self._update_devices_and_families()
+            except Exception as err:
+                _LOGGER.error("Error in device refresh loop: %s", err)
 
     def _publish_device_discovery(self):
         """Publish device discovery information to MQTT."""
         if not self.connected:
             return
 
-        # Create a simplified device list for discovery
         device_list = []
         for device_id, device in self.devices.items():
-            # Create parameter topics based on common parameters
             param_topics = {}
-
-            # Define common parameters for all devices
             common_params = [
                 "power",
                 "mode",
                 "temperature",
                 "fan_speed",
                 "current_temperature",
-            ]
+            ]  # TODO: make it actually correct names
+
             for param in common_params:
                 param_topics[param] = {
                     "state": PARAM_STATE_TOPIC_TEMPLATE.format(
@@ -721,16 +458,22 @@ class AuxCloudMQTTBridge:
             }
             device_list.append(device_info)
 
-        self._mqtt_client.publish(
-            DEVICE_DISCOVERY_TOPIC, json.dumps({"devices": device_list}), retain=True
-        )
+        if self._mqtt_client:
+            self._mqtt_client.publish(
+                DEVICE_DISCOVERY_TOPIC,
+                json.dumps({"devices": device_list}),
+                retain=True,
+            )
 
     def _publish_device_state(self, device_id: str, state: Dict[str, Any]):
         """Publish device state to MQTT."""
         if not self.connected:
             return
 
-        # Publish full state to main state topic
+        if not self._mqtt_client:
+            return
+
+        # Publish full state
         topic = STATE_TOPIC_TEMPLATE.format(device_id=device_id)
         self._mqtt_client.publish(topic, json.dumps(state), retain=True)
 
@@ -738,211 +481,91 @@ class AuxCloudMQTTBridge:
         available_topic = AVAILABLE_TOPIC_TEMPLATE.format(device_id=device_id)
         self._mqtt_client.publish(available_topic, "online", retain=True)
 
-        # Publish individual parameters to separate topics
+        # Publish individual parameters
         for param, value in state.items():
             param_topic = PARAM_STATE_TOPIC_TEMPLATE.format(
                 device_id=device_id, param=param
             )
-
-            # Format the value appropriately
-            if isinstance(value, (dict, list)):
-                formatted_value = json.dumps(value)
-            else:
-                formatted_value = str(value)
-
+            formatted_value = (
+                json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+            )
             self._mqtt_client.publish(param_topic, formatted_value, retain=True)
+
+    def _publish_response(
+        self,
+        device_id: str,
+        success: bool,
+        message: str,
+        command_data: Optional[Dict[str, Any]] = None,
+    ):
+        """Publish command response."""
+        if not self.connected:
+            return
+
+        response = {
+            "device_id": device_id,
+            "success": success,
+            "message": message,
+        }
+        if command_data:
+            response["command"] = command_data
+
+        if self._mqtt_client:
+            self._mqtt_client.publish(COMMAND_RESPONSE_TOPIC, json.dumps(response))
 
     def _publish_error(self, error_message: str):
         """Publish error message to MQTT."""
         if not self.connected:
             return
 
-        self._mqtt_client.publish(
-            ERROR_TOPIC,
-            json.dumps({"timestamp": time.time(), "message": error_message}),
-        )
-
-    async def _device_refresh_loop(self):
-        """Periodically refresh the list of devices."""
-        while self.running:
-            try:
-                # Wait for the refresh interval
-                await asyncio.sleep(self.device_refresh_interval)
-
-                if not self.running:
-                    break
-
-                _LOGGER.info("Refreshing devices list")
-
-                # Store existing device IDs
-                existing_device_ids = set(self.devices.keys())
-
-                # Update devices and families
-                await self._update_devices_and_families()
-
-                # Check for new devices
-                current_device_ids = set(self.devices.keys())
-                new_device_ids = current_device_ids - existing_device_ids
-
-                # Start update loops for new devices
-                for device_id in new_device_ids:
-                    _LOGGER.info(f"Starting update loop for new device: {device_id}")
-                    self.device_tasks[device_id] = asyncio.create_task(
-                        self._device_update_loop(device_id)
-                    )
-
-            except Exception as err:
-                _LOGGER.error("Error in device refresh loop: %s", err)
-                await asyncio.sleep(60)  # Wait a bit longer after error
-
-    async def _device_update_loop(self, device_id: str):
-        """Update loop for a single device."""
-        while self.running:
-            try:
-                # Process any queued commands
-                commands_to_process = []
-                with threading.Lock():
-                    if AuxCloudMQTTBridge._command_queue:
-                        commands_to_process = AuxCloudMQTTBridge._command_queue.copy()
-                        AuxCloudMQTTBridge._command_queue.clear()
-
-                force_refresh_this_cycle = False
-                for cmd in commands_to_process:
-                    try:
-                        if (
-                            len(cmd) == 2
-                        ):  # Handle old format commands for backward compatibility
-                            device_id, command_data = cmd
-                            force_refresh = False
-                        else:
-                            device_id, command_data, force_refresh = cmd
-
-                        _LOGGER.info(
-                            f"Processing queued command for {device_id}: {command_data} (force_refresh: {force_refresh})"
-                        )
-                        await self._handle_device_command(
-                            device_id, command_data, force_refresh
-                        )
-                        if force_refresh:
-                            force_refresh_this_cycle = True
-                    except Exception as cmd_err:
-                        _LOGGER.error(f"Error processing queued command: {cmd_err}")
-
-                # If we had a force refresh command, don't wait for the next interval
-                if force_refresh_this_cycle:
-                    continue
-
-                if not self.aux_api.is_logged_in():
-                    await self.aux_api.login(self.aux_email, self.aux_password)
-
-                # Get device state
-                device = self.devices[device_id]
-                device_state = await self.aux_api.get_device_params(device)
-
-                # Publish device state
-                self._publish_device_state(device_id, device_state)
-
-                # Wait for the next update, unless we just did a refresh
-                await asyncio.sleep(self.update_interval)
-            except ExpiredTokenError:
-                _LOGGER.warning("Token expired, attempting to re-login")
-                try:
-                    await self.aux_api.login(self.aux_email, self.aux_password)
-                except Exception as err:
-                    _LOGGER.error("Failed to re-login: %s", err)
-                    await asyncio.sleep(60)  # Wait a bit longer after login failure
-            except Exception as err:
-                _LOGGER.error("Error updating device %s: %s", device_id, err)
-                await asyncio.sleep(60)  # Wait a bit longer after error
+        if self._mqtt_client:
+            self._mqtt_client.publish(
+                ERROR_TOPIC,
+                json.dumps({"timestamp": time.time(), "message": error_message}),
+            )
 
     async def async_stop(self):
         """Stop the bridge."""
         _LOGGER.info("Stopping AUX Cloud MQTT Bridge")
         self.running = False
 
-        # Cancel device update tasks
-        for task in self.device_tasks.values():
+        # Cancel all tasks
+        for task in self.tasks.values():
+            task.cancel()
             try:
-                task.cancel()
-                # Wait for task to be cancelled, but with timeout
-                try:
-                    await asyncio.wait_for(task, timeout=5.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.warning(f"Task cancellation timed out")
-            except Exception as err:
-                _LOGGER.warning(f"Error cancelling task: {err}")
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
 
-        # Cancel the device refresh task
-        if self.refresh_task:
-            try:
-                self.refresh_task.cancel()
-                # Wait for task to be cancelled, but with timeout
-                try:
-                    await asyncio.wait_for(self.refresh_task, timeout=5.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("Refresh task cancellation timed out")
-            except Exception as err:
-                _LOGGER.warning(f"Error cancelling refresh task: {err}")
-
-        # Set device availability status to offline
-        if self.connected:
+        # Set devices offline
+        if self.connected and self._mqtt_client:
             for device_id in self.devices:
-                try:
-                    offline_topic = AVAILABLE_TOPIC_TEMPLATE.format(device_id=device_id)
-                    self._mqtt_client.publish(offline_topic, "offline", retain=True)
-                except Exception as err:
-                    _LOGGER.warning(f"Error publishing offline status: {err}")
+                offline_topic = AVAILABLE_TOPIC_TEMPLATE.format(device_id=device_id)
+                self._mqtt_client.publish(offline_topic, "offline", retain=True)
 
-        # Close WebSocket connection if open
-        if hasattr(self.aux_api, "ws_api") and self.aux_api.ws_api:
+        # Close connections
+        if self.aux_api and hasattr(self.aux_api, "ws_api") and self.aux_api.ws_api:
             try:
                 await self.aux_api.ws_api.close_websocket()
-            except Exception as err:
-                _LOGGER.warning(f"Error closing WebSocket: {err}")
+            except Exception:
+                pass
 
-        # Stop MQTT client
         if self._mqtt_client:
             try:
                 self._mqtt_client.loop_stop()
                 self._mqtt_client.disconnect()
-            except Exception as err:
-                _LOGGER.warning(f"Error disconnecting MQTT client: {err}")
-
-        # Clear the command queue
-        with threading.Lock():
-            AuxCloudMQTTBridge._command_queue.clear()
-
-    def _schedule_state_fetch(self, device_id, device):
-        """Mark device for state refresh on next update cycle."""
-        _LOGGER.info(f"Marking device {device_id} for immediate state refresh")
-        # Execute apply command immediately instead of queuing
-        asyncio.run_coroutine_threadsafe(
-            self._handle_apply_command(device_id), self._event_loop
-        )
+            except Exception:
+                pass
 
 
 async def load_config(config_path: str):
     """Load configuration from YAML file."""
-    try:
-        with open(config_path, "r") as file:
-            return yaml.safe_load(file)
-    except Exception as err:
-        _LOGGER.error("Error loading config file: %s", err)
-        raise
+    with open(config_path, "r") as file:
+        return yaml.safe_load(file)
 
 
 async def main():
-    """Run the AUX Cloud MQTT Bridge.
-
-    Performs initial setup and validation:
-    1. Checks for compatible Python version (3.7+)
-    2. Loads configuration
-    3. Initializes and starts the bridge
-
-    Returns:
-        int: Exit code (0 for success, 1 for error)
-    """
-    # Check Python version
+    """Run the AUX Cloud MQTT Bridge."""
     if sys.version_info < (3, 7):
         _LOGGER.error("This script requires Python 3.7 or newer")
         return 1
@@ -958,12 +581,12 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, signal_handler)
 
-    # Load config
+    # Load configuration
     config_path = os.environ.get("CONFIG_PATH", "aux_cloud_mqtt_config.yaml")
     try:
         config = await load_config(config_path)
-    except Exception:
-        _LOGGER.error("Failed to load configuration. Exiting.")
+    except Exception as err:
+        _LOGGER.error("Failed to load configuration: %s", err)
         return 1
 
     # Set log level
@@ -987,9 +610,8 @@ async def main():
         enable_websocket=bool(config.get("settings", {}).get("enable_websocket", True)),
     )
 
-    setup_success = await bridge.async_setup()
-    if not setup_success:
-        _LOGGER.error("Failed to set up AUX Cloud MQTT Bridge. Exiting.")
+    if not await bridge.async_setup():
+        _LOGGER.error("Failed to set up AUX Cloud MQTT Bridge")
         return 1
 
     # Wait for stop signal
