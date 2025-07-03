@@ -78,6 +78,7 @@ class AuxCloudMQTTBridge:
         self.aux_api: Optional[AuxCloudAPI] = None
         self.devices = {}
         self.families = {}
+        self.device_states = {}  # device_id -> current state dict
         self.connected = False
         self.running = False
         self.tasks = {}
@@ -236,6 +237,10 @@ class AuxCloudMQTTBridge:
                         k: v for k, v in decoded.items() if k not in ["did", "pid"]
                     }
                     if state_update:
+                        # Update cached state
+                        if device_id not in self.device_states:
+                            self.device_states[device_id] = {}
+                        self.device_states[device_id].update(state_update)
                         self._publish_device_state(device_id, state_update)
                         _LOGGER.debug(
                             "Updated device state from WebSocket: %s", device_id
@@ -380,25 +385,45 @@ class AuxCloudMQTTBridge:
             return
 
         try:
+            # Filter out commands that don't change current state
+            filtered_commands = await self._filter_unchanged_commands(
+                device_id, command_data
+            )
+
+            if not filtered_commands:
+                _LOGGER.info(
+                    "No state changes needed for device %s - all values already match current state: %s",
+                    device_id,
+                    command_data,
+                )
+                self._publish_response(
+                    device_id,
+                    True,
+                    "No changes needed - all values already match current state",
+                    command_data,
+                )
+                return
+
             # Initialize pending commands for device if not exists
             if device_id not in self.pending_commands:
                 self.pending_commands[device_id] = {}
 
-            # Update pending commands with new data
-            self.pending_commands[device_id].update(command_data)
+            # Update pending commands with filtered data
+            self.pending_commands[device_id].update(filtered_commands)
 
             # Schedule auto-apply after timeout
             await self._schedule_auto_apply(device_id)
 
             _LOGGER.info(
-                "Buffered commands for device %s: %s (pending: %s)",
+                "Buffered commands for device %s: %s (filtered from %s, pending: %s)",
                 device_id,
+                filtered_commands,
                 command_data,
                 self.pending_commands[device_id],
             )
 
             self._publish_response(
-                device_id, True, "Command buffered for bulk apply", command_data
+                device_id, True, "Command buffered for bulk apply", filtered_commands
             )
 
         except Exception as err:
@@ -431,6 +456,7 @@ class AuxCloudMQTTBridge:
 
             # Get updated state after applying commands
             updated_state = await self.aux_api.get_device_params(device)
+            self.device_states[device_id] = updated_state  # Store current state
             self._publish_device_state(device_id, updated_state)
 
             # Clear pending commands
@@ -472,6 +498,7 @@ class AuxCloudMQTTBridge:
                 await self._ensure_logged_in()
                 device = self.devices[device_id]
                 updated_state = await self.aux_api.get_device_params(device)
+                self.device_states[device_id] = updated_state  # Store current state
                 self._publish_device_state(device_id, updated_state)
                 self._publish_response(
                     device_id, True, "Device state refreshed (no pending commands)"
@@ -480,6 +507,121 @@ class AuxCloudMQTTBridge:
         except Exception as err:
             _LOGGER.error("Error in apply command for device %s: %s", device_id, err)
             self._publish_error(f"Error in apply command for device {device_id}: {err}")
+
+    async def _filter_unchanged_commands(
+        self, device_id: str, command_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Filter out commands that don't change the current state."""
+        # If we don't have current state, get it first
+        if device_id not in self.device_states:
+            try:
+                _LOGGER.debug(
+                    "Fetching current state for device %s for comparison", device_id
+                )
+                await self._ensure_logged_in()
+                device = self.devices[device_id]
+                current_state = await self.aux_api.get_device_params(device)
+                self.device_states[device_id] = current_state
+                _LOGGER.debug(
+                    "Retrieved current state for device %s: %s",
+                    device_id,
+                    current_state,
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Could not get current state for device %s: %s. Proceeding with all commands.",
+                    device_id,
+                    err,
+                )
+                return command_data
+
+        current_state = self.device_states[device_id]
+        filtered_commands = {}
+
+        _LOGGER.debug(
+            "Comparing requested commands with current state for device %s", device_id
+        )
+        for param, requested_value in command_data.items():
+            current_value = current_state.get(param)
+
+            # Convert values to comparable types
+            if self._values_differ(current_value, requested_value):
+                filtered_commands[param] = requested_value
+                _LOGGER.debug(
+                    "Device %s param %s: %s -> %s (will update)",
+                    device_id,
+                    param,
+                    current_value,
+                    requested_value,
+                )
+            else:
+                _LOGGER.debug(
+                    "Device %s param %s: %s (no change needed)",
+                    device_id,
+                    param,
+                    current_value,
+                )
+
+        if filtered_commands:
+            _LOGGER.info(
+                "Device %s: %d of %d commands need updates: %s",
+                device_id,
+                len(filtered_commands),
+                len(command_data),
+                list(filtered_commands.keys()),
+            )
+        else:
+            _LOGGER.info(
+                "Device %s: All %d commands match current state, no updates needed",
+                device_id,
+                len(command_data),
+            )
+
+        return filtered_commands
+
+    def _values_differ(self, current_value: Any, requested_value: Any) -> bool:
+        """Check if two values are different, handling type conversions."""
+        # Handle None values
+        if current_value is None and requested_value is None:
+            return False
+        if current_value is None or requested_value is None:
+            return True
+
+        # Handle boolean values (convert string representations)
+        if isinstance(current_value, bool) or isinstance(requested_value, bool):
+            current_bool = self._to_bool(current_value)
+            requested_bool = self._to_bool(requested_value)
+            return current_bool != requested_bool
+
+        # Handle numeric values (convert string representations)
+        if isinstance(current_value, (int, float)) or isinstance(
+            requested_value, (int, float)
+        ):
+            try:
+                current_num = float(current_value)
+                requested_num = float(requested_value)
+                return (
+                    abs(current_num - requested_num) > 1e-6
+                )  # Use small epsilon for float comparison
+            except (ValueError, TypeError):
+                pass
+
+        # Handle string comparisons (case-insensitive)
+        if isinstance(current_value, str) and isinstance(requested_value, str):
+            return current_value.lower() != requested_value.lower()
+
+        # Default comparison
+        return current_value != requested_value
+
+    def _to_bool(self, value: Any) -> bool:
+        """Convert various value types to boolean."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "on", "yes")
+        if isinstance(value, (int, float)):
+            return value != 0
+        return bool(value)
 
     async def _ensure_logged_in(self):
         """Ensure API is logged in, re-login if necessary."""
@@ -537,6 +679,9 @@ class AuxCloudMQTTBridge:
                                 # No pending commands, just get current state
                                 device_state = await self.aux_api.get_device_params(
                                     device
+                                )
+                                self.device_states[device_id] = (
+                                    device_state  # Store current state
                                 )
                                 self._publish_device_state(device_id, device_state)
                     except Exception as err:
@@ -612,6 +757,11 @@ class AuxCloudMQTTBridge:
         if not self.connected or not self._mqtt_client:
             return
 
+        # Update cached state
+        if device_id not in self.device_states:
+            self.device_states[device_id] = {}
+        self.device_states[device_id].update(state)
+
         # Publish full state
         topic = STATE_TOPIC_TEMPLATE.format(device_id=device_id)
         self._mqtt_client.publish(topic, json.dumps(state), retain=True)
@@ -685,9 +835,15 @@ class AuxCloudMQTTBridge:
             if self.pending_commands[device_id]:
                 try:
                     await self._execute_pending_commands(device_id)
-                    _LOGGER.info("Applied pending commands for device %s on shutdown", device_id)
+                    _LOGGER.info(
+                        "Applied pending commands for device %s on shutdown", device_id
+                    )
                 except Exception as err:
-                    _LOGGER.error("Error applying pending commands on shutdown for device %s: %s", device_id, err)
+                    _LOGGER.error(
+                        "Error applying pending commands on shutdown for device %s: %s",
+                        device_id,
+                        err,
+                    )
 
         # Clear pending commands
         self.pending_commands.clear()
